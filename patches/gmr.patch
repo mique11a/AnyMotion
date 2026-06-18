@@ -1,0 +1,1188 @@
+diff --git a/README.md b/README.md
+index 908469c..f33718c 100644
+--- a/README.md
++++ b/README.md
+@@ -321,6 +321,53 @@ Then, run the command below to retarget the extracted human pose data to your ro
+ python scripts/gvhmr_to_robot.py --gvhmr_pred_file <path_to_hmr4d_results.pt> --robot unitree_g1 --record_video
+ ```
+ 
++### Retargeting from HumanML / MDM to Robot
++
++For HumanML3D or MDM-style results such as `results.npy`, GMR provides a lightweight adapter that:
++
++- reads a 22-joint motion sequence from `results.npy` or a compatible `.npz`
++- estimates human height from the sequence
++- interpolates the motion from `20 fps` to `30 fps`
++- converts the joint trajectory into the per-frame human pose dictionary expected by GMR
++
++Retarget a single sequence:
++
++```bash
++python scripts/humanml_to_robot.py \
++  --motion_file <path_to_results.npy> \
++  --robot unitree_g1 \
++  --sample_idx 0 \
++  --repetition_idx 0 \
++  --save_path <path_to_save_robot_data.pkl> \
++  --rate_limit
++```
++
++Example:
++
++```bash
++python scripts/humanml_to_robot.py \
++  --motion_file /home/hjj/AnyMotion/src/motion-diffusion-model/save/humanml_trans_dec_512_bert/samples_humanml_trans_dec_512_bert_000600000_seed10_a_man_is_boxing_and_fighting/results.npy \
++  --robot unitree_g1 \
++  --sample_idx 0 \
++  --repetition_idx 0 \
++  --save_path retargeting_data/humanml_boxing_g1.pkl \
++  --rate_limit
++```
++render:
++```
++python scripts/vis_robot_motion.py --robot unitree_g1 --robot_motion_path retargeting_data/humanml_boxing_g1.pkl
++```
++
++
++Notes:
++
++- `--sample_idx` selects one generated sample.
++- `--repetition_idx` selects one repetition for that sample.
++- `--sequence_idx` can be used instead of `--sample_idx/--repetition_idx` to address the flattened sequence directly.
++- `--source_fps` defaults to the file metadata when present, otherwise `20`.
++- `--target_fps` defaults to `30`.
++- `--human_height` can override the automatic height estimate if needed.
++- `--no_visualize` runs the conversion and optional export without opening MuJoCo.
+ 
+ 
+ ## Retargeting from BVH (LAFAN1, Nokov) to Robot
+diff --git a/general_motion_retargeting/motion_retarget.py b/general_motion_retargeting/motion_retarget.py
+index b68bfdc..b7b7999 100644
+--- a/general_motion_retargeting/motion_retarget.py
++++ b/general_motion_retargeting/motion_retarget.py
+@@ -15,6 +15,7 @@ class GeneralMotionRetargeting:
+         src_human: str,
+         tgt_robot: str,
+         actual_human_height: float = None,
++        ik_config_path: str = None,
+         solver: str="daqp", # change from "quadprog" to "daqp".
+         damping: float=5e-1, # change from 1e-1 to 1e-2.
+         verbose: bool=True,
+@@ -54,10 +55,11 @@ class GeneralMotionRetargeting:
+                 print(f"Motor ID {i}: {motor_name}")
+ 
+         # Load the IK config
+-        with open(IK_CONFIG_DICT[src_human][tgt_robot]) as f:
++        resolved_ik_config_path = ik_config_path or str(IK_CONFIG_DICT[src_human][tgt_robot])
++        with open(resolved_ik_config_path) as f:
+             ik_config = json.load(f)
+         if verbose:
+-            print("Use IK config: ", IK_CONFIG_DICT[src_human][tgt_robot])
++            print("Use IK config: ", resolved_ik_config_path)
+         
+         # compute the scale ratio based on given human height and the assumption in the IK config
+         if actual_human_height is not None:
+@@ -79,6 +81,34 @@ class GeneralMotionRetargeting:
+         self.use_ik_match_table2 = ik_config["use_ik_match_table2"]
+         self.human_scale_table = ik_config["human_scale_table"]
+         self.ground = ik_config["ground_height"] * np.array([0, 0, 1])
++        self.root_heading_lock = ik_config.get("human_root_heading_lock", {"enabled": False})
++        self.root_heading_reference = None
++        self.root_heading_lock_strength = None
++        self.latest_root_heading_lock_strength = None
++        self.excluded_task_frames = set(ik_config.get("exclude_ik_match_frames", []))
++        self.excluded_task_bodies = set(ik_config.get("exclude_ik_match_bodies", []))
++        self.locked_joint_positions = ik_config.get("locked_joint_positions", {})
++        self.locked_joint_specs = []
++        self.clamped_joint_positions = ik_config.get("clamped_joint_positions", {})
++        self.clamped_joint_specs = []
++        self.joint_posture_priors = ik_config.get("joint_posture_priors", {"enabled": False})
++        self.posture_task = None
++        self.posture_task_specs = []
++        self.joint_damping_priors = ik_config.get("joint_damping_priors", {"enabled": False})
++        self.damping_task = None
++        self.damping_task_specs = []
++        self.adaptive_leg_task_weighting = ik_config.get(
++            "adaptive_leg_task_weighting", {"enabled": False}
++        )
++        self.adaptive_ground_alignment = ik_config.get(
++            "adaptive_ground_alignment", {"enabled": False}
++        )
++        self.ground_alignment_shift = None
++        self.latest_ground_alignment_shift = 0.0
++        self.adaptive_leg_prev_positions = {}
++        self.adaptive_leg_support_state = {}
++        self.adaptive_leg_component_state = {}
++        self.latest_leg_support_scores = {}
+ 
+         self.max_iter = 10
+ 
+@@ -91,6 +121,10 @@ class GeneralMotionRetargeting:
+         self.rot_offsets1 = {}
+         self.pos_offsets2 = {}
+         self.rot_offsets2 = {}
++        self.pos_offsets = {}
++        self.rot_offsets = {}
++        self.base_task_costs1 = {}
++        self.base_task_costs2 = {}
+ 
+         self.task_errors1 = {}
+         self.task_errors2 = {}
+@@ -112,6 +146,8 @@ class GeneralMotionRetargeting:
+         
+         for frame_name, entry in self.ik_match_table1.items():
+             body_name, pos_weight, rot_weight, pos_offset, rot_offset = entry
++            if frame_name in self.excluded_task_frames or body_name in self.excluded_task_bodies:
++                continue
+             if pos_weight != 0 or rot_weight != 0:
+                 task = mink.FrameTask(
+                     frame_name=frame_name,
+@@ -125,11 +161,19 @@ class GeneralMotionRetargeting:
+                 self.rot_offsets1[body_name] = R.from_quat(
+                     rot_offset, scalar_first=True
+                 )
++                self.pos_offsets[body_name] = self.pos_offsets1[body_name]
++                self.rot_offsets[body_name] = self.rot_offsets1[body_name]
++                self.base_task_costs1[body_name] = (
++                    np.atleast_1d(np.asarray(pos_weight, dtype=np.float64)).copy(),
++                    np.atleast_1d(np.asarray(rot_weight, dtype=np.float64)).copy(),
++                )
+                 self.tasks1.append(task)
+                 self.task_errors1[task] = []
+         
+         for frame_name, entry in self.ik_match_table2.items():
+             body_name, pos_weight, rot_weight, pos_offset, rot_offset = entry
++            if frame_name in self.excluded_task_frames or body_name in self.excluded_task_bodies:
++                continue
+             if pos_weight != 0 or rot_weight != 0:
+                 task = mink.FrameTask(
+                     frame_name=frame_name,
+@@ -143,19 +187,269 @@ class GeneralMotionRetargeting:
+                 self.rot_offsets2[body_name] = R.from_quat(
+                     rot_offset, scalar_first=True
+                 )
++                if body_name not in self.pos_offsets:
++                    self.pos_offsets[body_name] = self.pos_offsets2[body_name]
++                    self.rot_offsets[body_name] = self.rot_offsets2[body_name]
++                self.base_task_costs2[body_name] = (
++                    np.atleast_1d(np.asarray(pos_weight, dtype=np.float64)).copy(),
++                    np.atleast_1d(np.asarray(rot_weight, dtype=np.float64)).copy(),
++                )
+                 self.tasks2.append(task)
+                 self.task_errors2[task] = []
+ 
++        self.setup_locked_joints()
++        self.setup_clamped_joints()
++        self.setup_joint_posture_task()
++        self.setup_joint_damping_task()
++
++    def setup_locked_joints(self):
++        self.locked_joint_specs = []
++        for joint_name, target_value in self.locked_joint_positions.items():
++            joint_id = mj.mj_name2id(self.model, mj.mjtObj.mjOBJ_JOINT, joint_name)
++            if joint_id == -1:
++                raise ValueError(f"Locked joint {joint_name} not found in robot model")
++
++            joint_type = int(self.model.jnt_type[joint_id])
++            if joint_type not in (mj.mjtJoint.mjJNT_HINGE, mj.mjtJoint.mjJNT_SLIDE):
++                raise ValueError(
++                    f"Locked joint {joint_name} must be a 1-DoF hinge/slide joint, got type {joint_type}"
++                )
++
++            self.locked_joint_specs.append(
++                {
++                    "joint_name": joint_name,
++                    "qpos_adr": int(self.model.jnt_qposadr[joint_id]),
++                    "qvel_adr": int(self.model.jnt_dofadr[joint_id]),
++                    "target": float(target_value),
++                }
++            )
++
++        self.enforce_locked_joints()
++
++    def setup_clamped_joints(self):
++        self.clamped_joint_specs = []
++        for joint_name, clamp_config in self.clamped_joint_positions.items():
++            joint_id = mj.mj_name2id(self.model, mj.mjtObj.mjOBJ_JOINT, joint_name)
++            if joint_id == -1:
++                raise ValueError(f"Clamped joint {joint_name} not found in robot model")
++
++            joint_type = int(self.model.jnt_type[joint_id])
++            if joint_type not in (mj.mjtJoint.mjJNT_HINGE, mj.mjtJoint.mjJNT_SLIDE):
++                raise ValueError(
++                    f"Clamped joint {joint_name} must be a 1-DoF hinge/slide joint, got type {joint_type}"
++                )
++
++            if not isinstance(clamp_config, dict):
++                raise ValueError(f"Clamp config for {joint_name} must be a dict with min/max")
++
++            min_value = clamp_config.get("min")
++            max_value = clamp_config.get("max")
++            if min_value is None or max_value is None:
++                raise ValueError(f"Clamp config for {joint_name} must define both min and max")
++            min_value = float(min_value)
++            max_value = float(max_value)
++            if min_value > max_value:
++                raise ValueError(f"Clamp config for {joint_name} has min > max")
++
++            self.clamped_joint_specs.append(
++                {
++                    "joint_name": joint_name,
++                    "qpos_adr": int(self.model.jnt_qposadr[joint_id]),
++                    "qvel_adr": int(self.model.jnt_dofadr[joint_id]),
++                    "min": min_value,
++                    "max": max_value,
++                }
++            )
++
++        self.enforce_clamped_joints()
++
++    def enforce_locked_joints(self):
++        if not self.locked_joint_specs:
++            return
++
++        qpos = self.configuration.data.qpos.copy()
++        for joint_spec in self.locked_joint_specs:
++            qpos[joint_spec["qpos_adr"]] = joint_spec["target"]
++            self.configuration.data.qvel[joint_spec["qvel_adr"]] = 0.0
++        self.configuration.update(qpos)
++
++    def enforce_clamped_joints(self):
++        if not self.clamped_joint_specs:
++            return
++
++        qpos = self.configuration.data.qpos.copy()
++        updated = False
++        for joint_spec in self.clamped_joint_specs:
++            qpos_adr = joint_spec["qpos_adr"]
++            clamped_value = float(np.clip(qpos[qpos_adr], joint_spec["min"], joint_spec["max"]))
++            if not np.isclose(clamped_value, qpos[qpos_adr]):
++                qpos[qpos_adr] = clamped_value
++                self.configuration.data.qvel[joint_spec["qvel_adr"]] = 0.0
++                updated = True
++        if updated:
++            self.configuration.update(qpos)
++
++    def enforce_joint_constraints(self):
++        self.enforce_locked_joints()
++        self.enforce_clamped_joints()
++
++    def setup_joint_posture_task(self):
++        if not self.joint_posture_priors.get("enabled", False):
++            self.posture_task = None
++            self.posture_task_specs = []
++            return
++
++        joint_configs = self.joint_posture_priors.get("joints", {})
++        if not joint_configs:
++            self.posture_task = None
++            self.posture_task_specs = []
++            return
++
++        cost_vector = np.zeros(self.model.nv, dtype=np.float64)
++        target_q = self.configuration.q.copy()
++        self.posture_task_specs = []
++
++        for joint_name, joint_config in joint_configs.items():
++            joint_id = mj.mj_name2id(self.model, mj.mjtObj.mjOBJ_JOINT, joint_name)
++            if joint_id == -1:
++                raise ValueError(f"Joint posture prior target {joint_name} not found in robot model")
++
++            joint_type = int(self.model.jnt_type[joint_id])
++            if joint_type not in (mj.mjtJoint.mjJNT_HINGE, mj.mjtJoint.mjJNT_SLIDE):
++                raise ValueError(
++                    f"Joint posture prior {joint_name} must be a 1-DoF hinge/slide joint, got type {joint_type}"
++                )
++
++            qpos_adr = int(self.model.jnt_qposadr[joint_id])
++            qvel_adr = int(self.model.jnt_dofadr[joint_id])
++            target_q[qpos_adr] = float(joint_config.get("target", 0.0))
++            cost_vector[qvel_adr] = float(joint_config.get("swing_cost", joint_config.get("cost", 0.0)))
++
++            self.posture_task_specs.append(
++                {
++                    "joint_name": joint_name,
++                    "qpos_adr": qpos_adr,
++                    "qvel_adr": qvel_adr,
++                    "target": float(joint_config.get("target", 0.0)),
++                    "support_metric": joint_config.get("support_metric"),
++                    "swing_cost": float(joint_config.get("swing_cost", joint_config.get("cost", 0.0))),
++                    "stance_cost": float(joint_config.get("stance_cost", joint_config.get("cost", 0.0))),
++                    "support_score_floor": float(joint_config.get("support_score_floor", 0.0)),
++                    "support_score_ceiling": float(joint_config.get("support_score_ceiling", 1.0)),
++                    "support_score_power": float(joint_config.get("support_score_power", 1.0)),
++                }
++            )
++
++        self.posture_task = mink.PostureTask(self.model, cost=cost_vector)
++        self.posture_task.set_target(target_q)
++
++    def update_joint_posture_task(self, support_scores=None):
++        if self.posture_task is None:
++            return
++
++        cost_vector = np.zeros(self.model.nv, dtype=np.float64)
++        for joint_spec in self.posture_task_specs:
++            support_metric = joint_spec.get("support_metric")
++            support_score = 1.0
++            if support_metric is not None and support_scores:
++                support_score = float(support_scores.get(support_metric, 0.0))
++            support_score = float(np.clip(support_score, 0.0, 1.0))
++            support_score = max(joint_spec["support_score_floor"], support_score)
++            support_score = min(joint_spec["support_score_ceiling"], support_score)
++            support_score_power = joint_spec["support_score_power"]
++            if support_score_power != 1.0:
++                support_score = float(np.power(np.clip(support_score, 0.0, 1.0), support_score_power))
++            joint_cost = self._interpolate_support_scale(
++                support_score,
++                joint_spec["swing_cost"],
++                joint_spec["stance_cost"],
++            )
++            cost_vector[joint_spec["qvel_adr"]] = joint_cost
++        self.posture_task.set_cost(cost_vector)
++
++    def setup_joint_damping_task(self):
++        if not self.joint_damping_priors.get("enabled", False):
++            self.damping_task = None
++            self.damping_task_specs = []
++            return
++
++        joint_configs = self.joint_damping_priors.get("joints", {})
++        if not joint_configs:
++            self.damping_task = None
++            self.damping_task_specs = []
++            return
++
++        cost_vector = np.zeros(self.model.nv, dtype=np.float64)
++        self.damping_task_specs = []
++
++        for joint_name, joint_config in joint_configs.items():
++            joint_id = mj.mj_name2id(self.model, mj.mjtObj.mjOBJ_JOINT, joint_name)
++            if joint_id == -1:
++                raise ValueError(f"Joint damping prior target {joint_name} not found in robot model")
++
++            joint_type = int(self.model.jnt_type[joint_id])
++            if joint_type not in (mj.mjtJoint.mjJNT_HINGE, mj.mjtJoint.mjJNT_SLIDE):
++                raise ValueError(
++                    f"Joint damping prior {joint_name} must be a 1-DoF hinge/slide joint, got type {joint_type}"
++                )
++
++            qvel_adr = int(self.model.jnt_dofadr[joint_id])
++            cost_vector[qvel_adr] = float(joint_config.get("swing_cost", joint_config.get("cost", 0.0)))
++            self.damping_task_specs.append(
++                {
++                    "joint_name": joint_name,
++                    "qvel_adr": qvel_adr,
++                    "support_metric": joint_config.get("support_metric"),
++                    "swing_cost": float(joint_config.get("swing_cost", joint_config.get("cost", 0.0))),
++                    "stance_cost": float(joint_config.get("stance_cost", joint_config.get("cost", 0.0))),
++                    "support_score_floor": float(joint_config.get("support_score_floor", 0.0)),
++                    "support_score_ceiling": float(joint_config.get("support_score_ceiling", 1.0)),
++                    "support_score_power": float(joint_config.get("support_score_power", 1.0)),
++                }
++            )
++
++        self.damping_task = mink.DampingTask(self.model, cost=cost_vector)
++
++    def update_joint_damping_task(self, support_scores=None):
++        if self.damping_task is None:
++            return
++
++        cost_vector = np.zeros(self.model.nv, dtype=np.float64)
++        for joint_spec in self.damping_task_specs:
++            support_metric = joint_spec.get("support_metric")
++            support_score = 1.0
++            if support_metric is not None and support_scores:
++                support_score = float(support_scores.get(support_metric, 0.0))
++            support_score = float(np.clip(support_score, 0.0, 1.0))
++            support_score = max(joint_spec["support_score_floor"], support_score)
++            support_score = min(joint_spec["support_score_ceiling"], support_score)
++            support_score_power = joint_spec["support_score_power"]
++            if support_score_power != 1.0:
++                support_score = float(np.power(np.clip(support_score, 0.0, 1.0), support_score_power))
++            joint_cost = self._interpolate_support_scale(
++                support_score,
++                joint_spec["swing_cost"],
++                joint_spec["stance_cost"],
++            )
++            cost_vector[joint_spec["qvel_adr"]] = joint_cost
++        self.damping_task.set_cost(cost_vector)
++
+   
+     def update_targets(self, human_data, offset_to_ground=False):
+         # scale human data in local frame
+         human_data = self.to_numpy(human_data)
+         human_data = self.scale_human_data(human_data, self.human_root_name, self.human_scale_table)
+-        human_data = self.offset_human_data(human_data, self.pos_offsets1, self.rot_offsets1)
++        human_data = self.offset_human_data(human_data, self.pos_offsets, self.rot_offsets)
++        support_scores = self.maybe_compute_leg_support_scores(human_data)
++        human_data = self.lock_human_root_heading(human_data, support_scores)
++        human_data = self.apply_adaptive_ground_alignment(human_data, support_scores)
+         human_data = self.apply_ground_offset(human_data)
+         if offset_to_ground:
+             human_data = self.offset_human_data_to_ground(human_data)
+         self.scaled_human_data = human_data
++        self.apply_adaptive_task_weighting(human_data, support_scores)
++        self.update_joint_posture_task(support_scores)
++        self.update_joint_damping_task(support_scores)
+ 
+         if self.use_ik_match_table1:
+             for body_name in self.human_body_to_task1.keys():
+@@ -172,35 +466,47 @@ class GeneralMotionRetargeting:
+             
+     def retarget(self, human_data, offset_to_ground=False):
+         # Update the task targets
++        self.enforce_joint_constraints()
+         self.update_targets(human_data, offset_to_ground)
+ 
+         if self.use_ik_match_table1:
+             # Solve the IK problem
+             curr_error = self.error1()
+             dt = self.configuration.model.opt.timestep
++            active_tasks1 = self.tasks1 + (
++                ([self.posture_task] if self.posture_task is not None else [])
++                + ([self.damping_task] if self.damping_task is not None else [])
++            )
+             vel1 = mink.solve_ik(
+-                self.configuration, self.tasks1, dt, self.solver, self.damping, self.ik_limits
++                self.configuration, active_tasks1, dt, self.solver, self.damping, self.ik_limits
+             )
+             self.configuration.integrate_inplace(vel1, dt)
++            self.enforce_joint_constraints()
+             next_error = self.error1()
+             num_iter = 0
+             while curr_error - next_error > 0.001 and num_iter < self.max_iter:
+                 curr_error = next_error
+                 dt = self.configuration.model.opt.timestep
+                 vel1 = mink.solve_ik(
+-                    self.configuration, self.tasks1, dt, self.solver, self.damping, self.ik_limits
++                    self.configuration, active_tasks1, dt, self.solver, self.damping, self.ik_limits
+                 )
+                 self.configuration.integrate_inplace(vel1, dt)
++                self.enforce_joint_constraints()
+                 next_error = self.error1()
+                 num_iter += 1
+ 
+         if self.use_ik_match_table2:
+             curr_error = self.error2()
+             dt = self.configuration.model.opt.timestep
++            active_tasks2 = self.tasks2 + (
++                ([self.posture_task] if self.posture_task is not None else [])
++                + ([self.damping_task] if self.damping_task is not None else [])
++            )
+             vel2 = mink.solve_ik(
+-                self.configuration, self.tasks2, dt, self.solver, self.damping, self.ik_limits
++                self.configuration, active_tasks2, dt, self.solver, self.damping, self.ik_limits
+             )
+             self.configuration.integrate_inplace(vel2, dt)
++            self.enforce_joint_constraints()
+             next_error = self.error2()
+             num_iter = 0
+             while curr_error - next_error > 0.001 and num_iter < self.max_iter:
+@@ -208,9 +514,10 @@ class GeneralMotionRetargeting:
+                 # Solve the IK problem with the second task
+                 dt = self.configuration.model.opt.timestep
+                 vel2 = mink.solve_ik(
+-                    self.configuration, self.tasks2, dt, self.solver, self.damping, self.ik_limits
++                    self.configuration, active_tasks2, dt, self.solver, self.damping, self.ik_limits
+                 )
+                 self.configuration.integrate_inplace(vel2, dt)
++                self.enforce_joint_constraints()
+                 
+                 next_error = self.error2()
+                 num_iter += 1
+@@ -220,6 +527,8 @@ class GeneralMotionRetargeting:
+ 
+ 
+     def error1(self):
++        if not self.tasks1:
++            return 0.0
+         return np.linalg.norm(
+             np.concatenate(
+                 [task.compute_error(self.configuration) for task in self.tasks1]
+@@ -227,6 +536,8 @@ class GeneralMotionRetargeting:
+         )
+     
+     def error2(self):
++        if not self.tasks2:
++            return 0.0
+         return np.linalg.norm(
+             np.concatenate(
+                 [task.compute_error(self.configuration) for task in self.tasks2]
+@@ -268,20 +579,507 @@ class GeneralMotionRetargeting:
+     def offset_human_data(self, human_data, pos_offsets, rot_offsets):
+         """the pos offsets are applied in the local frame"""
+         offset_human_data = {}
++        identity_rot = R.from_quat([1.0, 0.0, 0.0, 0.0], scalar_first=True)
+         for body_name in human_data.keys():
+             pos, quat = human_data[body_name]
+             offset_human_data[body_name] = [pos, quat]
+             # apply rotation offset first
+-            updated_quat = (R.from_quat(quat, scalar_first=True) * rot_offsets[body_name]).as_quat(scalar_first=True)
++            body_rot_offset = rot_offsets.get(body_name, identity_rot)
++            updated_quat = (R.from_quat(quat, scalar_first=True) * body_rot_offset).as_quat(scalar_first=True)
+             offset_human_data[body_name][1] = updated_quat
+             
+-            local_offset = pos_offsets[body_name]
++            local_offset = pos_offsets.get(body_name, np.zeros(3, dtype=np.float64))
+             # compute the global position offset using the updated rotation
+             global_pos_offset = R.from_quat(updated_quat, scalar_first=True).apply(local_offset)
+             
+             offset_human_data[body_name][0] = pos + global_pos_offset
+            
+         return offset_human_data
++
++    def lock_human_root_heading(self, human_data, support_scores=None):
++        if not self.root_heading_lock.get("enabled", False):
++            return human_data
++        if self.human_root_name not in human_data:
++            return human_data
++
++        mode = self.root_heading_lock.get("mode", "initial")
++        if mode != "initial":
++            raise ValueError(f"Unsupported human_root_heading_lock mode: {mode}")
++
++        strength = self.compute_root_heading_lock_strength(support_scores)
++
++        root_pos, root_quat = human_data[self.human_root_name]
++        root_rot = R.from_quat(root_quat, scalar_first=True)
++        yaw, pitch, roll = root_rot.as_euler("zyx", degrees=False)
++
++        if self.root_heading_reference is None:
++            reference_deg = self.root_heading_lock.get("reference_deg", None)
++            self.root_heading_reference = (
++                np.deg2rad(float(reference_deg)) if reference_deg is not None else float(yaw)
++            )
++
++        yaw_delta = np.arctan2(
++            np.sin(yaw - self.root_heading_reference),
++            np.cos(yaw - self.root_heading_reference),
++        )
++        locked_yaw = self.root_heading_reference + (1.0 - strength) * yaw_delta
++        locked_rot = R.from_euler("zyx", [locked_yaw, pitch, roll], degrees=False)
++
++        locked_human_data = human_data.copy()
++        locked_human_data[self.human_root_name] = [
++            np.asarray(root_pos, dtype=np.float64).copy(),
++            locked_rot.as_quat(scalar_first=True),
++        ]
++        return locked_human_data
++
++    def compute_root_heading_lock_strength(self, support_scores):
++        base_strength = float(self.root_heading_lock.get("strength", 1.0))
++        base_strength = float(np.clip(base_strength, 0.0, 1.0))
++
++        adaptive_cfg = self.root_heading_lock.get("adaptive_single_support", {})
++        if not adaptive_cfg.get("enabled", False) or not support_scores:
++            self.root_heading_lock_strength = base_strength
++            self.latest_root_heading_lock_strength = base_strength
++            return base_strength
++
++        dominant_support = max(float(score) for score in support_scores.values())
++        weak_support = min(float(score) for score in support_scores.values())
++        support_margin = dominant_support - weak_support
++
++        dominant_support_min = float(adaptive_cfg.get("dominant_support_min", 0.8))
++        swing_support_max = float(adaptive_cfg.get("swing_support_max", 0.25))
++        support_margin_min = float(adaptive_cfg.get("support_margin_min", 0.35))
++        max_strength = float(adaptive_cfg.get("max_strength", 1.0))
++        strength_smoothing = float(adaptive_cfg.get("strength_smoothing", 0.0))
++        strength_smoothing = float(np.clip(strength_smoothing, 0.0, 0.95))
++
++        dominant_term = np.clip(
++            (dominant_support - dominant_support_min) / max(1.0 - dominant_support_min, 1e-6),
++            0.0,
++            1.0,
++        )
++        weak_term = np.clip(
++            (swing_support_max - weak_support) / max(swing_support_max, 1e-6),
++            0.0,
++            1.0,
++        )
++        margin_term = np.clip(
++            (support_margin - support_margin_min) / max(1.0 - support_margin_min, 1e-6),
++            0.0,
++            1.0,
++        )
++        single_support_score = dominant_term * weak_term * margin_term
++        target_strength = base_strength + single_support_score * (max_strength - base_strength)
++
++        if self.root_heading_lock_strength is None:
++            filtered_strength = target_strength
++        else:
++            filtered_strength = (
++                strength_smoothing * self.root_heading_lock_strength
++                + (1.0 - strength_smoothing) * target_strength
++            )
++
++        filtered_strength = float(np.clip(filtered_strength, 0.0, 1.0))
++        self.root_heading_lock_strength = filtered_strength
++        self.latest_root_heading_lock_strength = filtered_strength
++        return filtered_strength
++
++    def apply_adaptive_ground_alignment(self, human_data, support_scores=None):
++        if not self.adaptive_ground_alignment.get("enabled", False):
++            self.latest_ground_alignment_shift = 0.0
++            self.ground_alignment_shift = None
++            return human_data
++
++        axis = int(self.adaptive_ground_alignment.get("height_axis", 2))
++        left_contact = self._resolve_contact_point(
++            human_data,
++            self.adaptive_ground_alignment,
++            "left",
++            axis,
++            "LeftFootMod",
++            fallback_cfg=self.adaptive_leg_task_weighting,
++        )
++        right_contact = self._resolve_contact_point(
++            human_data,
++            self.adaptive_ground_alignment,
++            "right",
++            axis,
++            "RightFootMod",
++            fallback_cfg=self.adaptive_leg_task_weighting,
++        )
++        if left_contact is None or right_contact is None:
++            self.latest_ground_alignment_shift = 0.0
++            return human_data
++
++        target_height = float(self.adaptive_ground_alignment.get("target_height", 0.0))
++        alignment_strength = float(self.adaptive_ground_alignment.get("alignment_strength", 1.0))
++        offset_smoothing = float(self.adaptive_ground_alignment.get("offset_smoothing", 0.0))
++        offset_smoothing = float(np.clip(offset_smoothing, 0.0, 0.95))
++        max_shift = float(self.adaptive_ground_alignment.get("max_shift", np.inf))
++        reference_mode = self.adaptive_ground_alignment.get("reference_mode", "lowest")
++
++        left_height = float(left_contact["pos"][axis])
++        right_height = float(right_contact["pos"][axis])
++        if reference_mode == "support_weighted" and support_scores:
++            left_weight = float(support_scores.get("left", 0.0))
++            right_weight = float(support_scores.get("right", 0.0))
++            total_weight = left_weight + right_weight
++            if total_weight > 1e-6:
++                reference_height = (left_weight * left_height + right_weight * right_height) / total_weight
++            else:
++                reference_height = min(left_height, right_height)
++        else:
++            reference_height = min(left_height, right_height)
++
++        activation_metric = self.adaptive_ground_alignment.get("activation_metric", "dominant")
++        activation = 1.0 if not support_scores else float(support_scores.get(activation_metric, 1.0))
++        activation_min = float(self.adaptive_ground_alignment.get("activation_min", 0.0))
++        activation_max = float(self.adaptive_ground_alignment.get("activation_max", 1.0))
++        if activation_max <= activation_min:
++            activation_scale = 1.0 if activation >= activation_max else 0.0
++        else:
++            activation_scale = float(
++                np.clip((activation - activation_min) / (activation_max - activation_min), 0.0, 1.0)
++            )
++        activation_floor = float(self.adaptive_ground_alignment.get("activation_floor", 0.0))
++        activation_scale = max(activation_floor, activation_scale)
++
++        target_shift = max(reference_height - target_height, 0.0)
++        target_shift = min(target_shift * alignment_strength * activation_scale, max_shift)
++
++        if self.ground_alignment_shift is None:
++            filtered_shift = target_shift
++        else:
++            filtered_shift = (
++                offset_smoothing * self.ground_alignment_shift
++                + (1.0 - offset_smoothing) * target_shift
++            )
++        filtered_shift = float(np.clip(filtered_shift, 0.0, max_shift))
++        self.ground_alignment_shift = filtered_shift
++        self.latest_ground_alignment_shift = filtered_shift
++
++        aligned_human_data = {}
++        for body_name, (pos, quat) in human_data.items():
++            aligned_human_data[body_name] = [
++                np.asarray(pos, dtype=np.float64).copy() - np.eye(3, dtype=np.float64)[axis] * filtered_shift,
++                quat,
++            ]
++        return aligned_human_data
++
++    def apply_adaptive_task_weighting(self, human_data, support_scores=None):
++        self.reset_task_costs()
++        if not self.adaptive_leg_task_weighting.get("enabled", False):
++            self.latest_leg_support_scores = {}
++            return
++
++        if support_scores is None:
++            support_scores = self.compute_leg_support_scores(human_data)
++        self.latest_leg_support_scores = support_scores
++        if not support_scores:
++            return
++
++        if self.use_ik_match_table1:
++            self._scale_task_group(
++                self.human_body_to_task1,
++                self.base_task_costs1,
++                support_scores,
++            )
++        if self.use_ik_match_table2:
++            self._scale_task_group(
++                self.human_body_to_task2,
++                self.base_task_costs2,
++                support_scores,
++            )
++
++    def maybe_compute_leg_support_scores(self, human_data):
++        need_support_scores = (
++            self.adaptive_leg_task_weighting.get("enabled", False)
++            or self.root_heading_lock.get("adaptive_single_support", {}).get("enabled", False)
++        )
++        if not need_support_scores:
++            self.latest_leg_support_scores = {}
++            return {}
++        support_scores = self.compute_leg_support_scores(human_data)
++        if support_scores:
++            left_score = float(support_scores.get("left", 0.0))
++            right_score = float(support_scores.get("right", 0.0))
++            support_scores["dominant"] = max(left_score, right_score)
++            support_scores["weak"] = min(left_score, right_score)
++            support_scores["single_support"] = self.compute_single_support_metric(support_scores)
++        self.latest_leg_support_scores = support_scores
++        return support_scores
++
++    def reset_task_costs(self):
++        if self.use_ik_match_table1:
++            for body_name, task in self.human_body_to_task1.items():
++                self._restore_task_cost(task, self.base_task_costs1[body_name])
++        if self.use_ik_match_table2:
++            for body_name, task in self.human_body_to_task2.items():
++                self._restore_task_cost(task, self.base_task_costs2[body_name])
++
++    def _restore_task_cost(self, task, base_costs):
++        base_pos_cost, base_rot_cost = base_costs
++        task.set_position_cost(base_pos_cost)
++        task.set_orientation_cost(base_rot_cost)
++
++    def _scale_task_group(self, task_group, base_cost_group, support_scores):
++        task_scales = self.adaptive_leg_task_weighting.get("task_scales", {})
++        for body_name, task in task_group.items():
++            scale_config = task_scales.get(body_name)
++            if scale_config is None:
++                continue
++
++            support_score = self._resolve_task_support_score(
++                body_name,
++                scale_config,
++                support_scores,
++            )
++            if support_score is None:
++                continue
++
++            pos_scale = self._interpolate_support_scale(
++                support_score,
++                scale_config.get("swing_pos_scale", 1.0),
++                scale_config.get("stance_pos_scale", 1.0),
++            )
++            rot_scale = self._interpolate_support_scale(
++                support_score,
++                scale_config.get("swing_rot_scale", 1.0),
++                scale_config.get("stance_rot_scale", 1.0),
++            )
++            base_pos_cost, base_rot_cost = base_cost_group[body_name]
++            task.set_position_cost(base_pos_cost * pos_scale)
++            task.set_orientation_cost(base_rot_cost * rot_scale)
++
++    def _resolve_task_support_score(self, body_name, scale_config, support_scores):
++        support_metric = scale_config.get("support_metric")
++        if support_metric is not None:
++            support_score = support_scores.get(support_metric)
++        else:
++            support_side = scale_config.get("support_side")
++            if support_side is None:
++                if body_name.startswith("Left"):
++                    support_side = "left"
++                elif body_name.startswith("Right"):
++                    support_side = "right"
++                else:
++                    return None
++
++            support_score = support_scores.get(support_side)
++            override_mode = scale_config.get("support_score_mode")
++            if override_mode is not None:
++                height_score = support_scores.get(f"{support_side}_height_score")
++                speed_score = support_scores.get(f"{support_side}_speed_score")
++                if height_score is not None and speed_score is not None:
++                    override_blend = float(
++                        scale_config.get(
++                            "support_score_blend",
++                            self.adaptive_leg_task_weighting.get("support_score_blend", 0.5),
++                        )
++                    )
++                    support_score = self._compose_support_score(
++                        height_score,
++                        speed_score,
++                        override_mode,
++                        override_blend,
++                    )
++
++        if support_score is None:
++            return None
++
++        support_score = float(np.clip(support_score, 0.0, 1.0))
++        support_score = max(
++            float(scale_config.get("support_score_floor", 0.0)),
++            support_score,
++        )
++        support_score = min(
++            float(scale_config.get("support_score_ceiling", 1.0)),
++            support_score,
++        )
++        support_score_power = float(scale_config.get("support_score_power", 1.0))
++        if support_score_power != 1.0:
++            support_score = float(np.power(np.clip(support_score, 0.0, 1.0), support_score_power))
++        return float(np.clip(support_score, 0.0, 1.0))
++
++    def _interpolate_support_scale(self, support_score, swing_scale, stance_scale):
++        support_score = float(np.clip(support_score, 0.0, 1.0))
++        return float(swing_scale) + support_score * (float(stance_scale) - float(swing_scale))
++
++    def _compose_support_score(self, height_score, speed_score, score_mode, score_blend):
++        height_score = float(np.clip(height_score, 0.0, 1.0))
++        speed_score = float(np.clip(speed_score, 0.0, 1.0))
++        score_blend = float(np.clip(score_blend, 0.0, 1.0))
++
++        if score_mode == "min":
++            return min(height_score, speed_score)
++        if score_mode == "max":
++            return max(height_score, speed_score)
++        return score_blend * height_score + (1.0 - score_blend) * speed_score
++
++    def compute_single_support_metric(self, support_scores):
++        metric_cfg = self.adaptive_leg_task_weighting.get("single_support_metric", {})
++        dominant_support = float(support_scores.get("dominant", 0.0))
++        weak_support = float(support_scores.get("weak", 0.0))
++        support_margin = dominant_support - weak_support
++
++        dominant_support_min = float(metric_cfg.get("dominant_support_min", 0.9))
++        weak_support_max = float(metric_cfg.get("weak_support_max", 0.15))
++        support_margin_min = float(metric_cfg.get("support_margin_min", 0.6))
++
++        dominant_term = np.clip(
++            (dominant_support - dominant_support_min) / max(1.0 - dominant_support_min, 1e-6),
++            0.0,
++            1.0,
++        )
++        weak_term = np.clip(
++            (weak_support_max - weak_support) / max(weak_support_max, 1e-6),
++            0.0,
++            1.0,
++        )
++        margin_term = np.clip(
++            (support_margin - support_margin_min) / max(1.0 - support_margin_min, 1e-6),
++            0.0,
++            1.0,
++        )
++        return float(dominant_term * weak_term * margin_term)
++
++    def _resolve_contact_body_names(self, cfg, side, default_body, fallback_cfg=None):
++        body_names = cfg.get(f"{side}_contact_bodies")
++        if body_names is None and fallback_cfg is not None:
++            body_names = fallback_cfg.get(f"{side}_contact_bodies")
++
++        if body_names is None:
++            body_name = cfg.get(f"{side}_contact_body")
++            if body_name is None and fallback_cfg is not None:
++                body_name = fallback_cfg.get(f"{side}_contact_body")
++            if body_name is None:
++                body_name = default_body
++            body_names = [body_name]
++
++        return [body_name for body_name in body_names if isinstance(body_name, str)]
++
++    def _resolve_contact_point(self, human_data, cfg, side, axis, default_body, fallback_cfg=None):
++        body_names = self._resolve_contact_body_names(cfg, side, default_body, fallback_cfg=fallback_cfg)
++        candidates = []
++        for body_name in body_names:
++            if body_name not in human_data:
++                continue
++            pos = np.asarray(human_data[body_name][0], dtype=np.float64)
++            candidates.append((body_name, pos))
++
++        if not candidates:
++            return None
++
++        mode = cfg.get("contact_body_mode")
++        if mode is None and fallback_cfg is not None:
++            mode = fallback_cfg.get("contact_body_mode")
++        mode = mode or "lowest"
++
++        if mode == "average":
++            positions = np.stack([pos for _, pos in candidates], axis=0)
++            body_name = candidates[0][0]
++            pos = np.mean(positions, axis=0)
++            return {"body_name": body_name, "pos": pos}
++
++        body_name, pos = min(candidates, key=lambda item: item[1][axis])
++        return {"body_name": body_name, "pos": pos.copy()}
++
++    def _compute_contact_speed(self, side, contact_pos, human_data, axis):
++        speed_reference_frame = self.adaptive_leg_task_weighting.get("speed_reference_frame", "world")
++        speed_ignore_height_axis = bool(
++            self.adaptive_leg_task_weighting.get("speed_ignore_height_axis", False)
++        )
++
++        reference_pos = np.asarray(contact_pos, dtype=np.float64).copy()
++        if speed_reference_frame == "root_relative" and self.human_root_name in human_data:
++            root_pos = np.asarray(human_data[self.human_root_name][0], dtype=np.float64)
++            reference_pos = reference_pos - root_pos
++
++        if speed_ignore_height_axis:
++            reference_pos = np.delete(reference_pos, axis)
++
++        prev_pos = self.adaptive_leg_prev_positions.get(side)
++        speed = 0.0 if prev_pos is None else float(np.linalg.norm(reference_pos - prev_pos))
++        self.adaptive_leg_prev_positions[side] = reference_pos.copy()
++        return speed
++
++    def compute_leg_support_scores(self, human_data):
++        axis = int(self.adaptive_leg_task_weighting.get("height_axis", 2))
++        stance_height = float(self.adaptive_leg_task_weighting.get("stance_height", 0.015))
++        swing_height = float(self.adaptive_leg_task_weighting.get("swing_height", 0.08))
++        stance_speed = float(self.adaptive_leg_task_weighting.get("stance_speed", 0.004))
++        swing_speed = float(self.adaptive_leg_task_weighting.get("swing_speed", 0.012))
++        score_blend = float(self.adaptive_leg_task_weighting.get("support_score_blend", 0.5))
++        score_smoothing = float(self.adaptive_leg_task_weighting.get("score_smoothing", 0.0))
++        score_mode = self.adaptive_leg_task_weighting.get("support_score_mode", "blend")
++        score_blend = float(np.clip(score_blend, 0.0, 1.0))
++        score_smoothing = float(np.clip(score_smoothing, 0.0, 0.95))
++        left_contact = self._resolve_contact_point(
++            human_data,
++            self.adaptive_leg_task_weighting,
++            "left",
++            axis,
++            "LeftFootMod",
++        )
++        right_contact = self._resolve_contact_point(
++            human_data,
++            self.adaptive_leg_task_weighting,
++            "right",
++            axis,
++            "RightFootMod",
++        )
++        if left_contact is None or right_contact is None:
++            return {}
++
++        left_pos = left_contact["pos"]
++        right_pos = right_contact["pos"]
++        lowest_height = min(left_pos[axis], right_pos[axis])
++
++        support_scores = {}
++        for side, pos in (
++            ("left", left_pos),
++            ("right", right_pos),
++        ):
++            speed = self._compute_contact_speed(side, pos, human_data, axis)
++
++            rel_height = float(pos[axis] - lowest_height)
++            height_score = 1.0 - np.clip(
++                (rel_height - stance_height) / max(swing_height - stance_height, 1e-6),
++                0.0,
++                1.0,
++            )
++            speed_score = 1.0 - np.clip(
++                (speed - stance_speed) / max(swing_speed - stance_speed, 1e-6),
++                0.0,
++                1.0,
++            )
++            height_key = f"{side}_height_score"
++            prev_height_score = self.adaptive_leg_component_state.get(height_key, height_score)
++            smooth_height_score = score_smoothing * prev_height_score + (1.0 - score_smoothing) * height_score
++            smooth_height_score = float(np.clip(smooth_height_score, 0.0, 1.0))
++            self.adaptive_leg_component_state[height_key] = smooth_height_score
++            support_scores[height_key] = smooth_height_score
++
++            speed_key = f"{side}_speed_score"
++            prev_speed_score = self.adaptive_leg_component_state.get(speed_key, speed_score)
++            smooth_speed_score = score_smoothing * prev_speed_score + (1.0 - score_smoothing) * speed_score
++            smooth_speed_score = float(np.clip(smooth_speed_score, 0.0, 1.0))
++            self.adaptive_leg_component_state[speed_key] = smooth_speed_score
++            support_scores[speed_key] = smooth_speed_score
++
++            raw_score = self._compose_support_score(
++                height_score,
++                speed_score,
++                score_mode,
++                score_blend,
++            )
++            prev_score = self.adaptive_leg_support_state.get(side, raw_score)
++            support_score = score_smoothing * prev_score + (1.0 - score_smoothing) * raw_score
++            support_score = float(np.clip(support_score, 0.0, 1.0))
++            self.adaptive_leg_support_state[side] = support_score
++            support_scores[side] = support_score
++
++        return support_scores
+             
+     def offset_human_data_to_ground(self, human_data):
+         """find the lowest point of the human data and offset the human data to the ground"""
+diff --git a/general_motion_retargeting/params.py b/general_motion_retargeting/params.py
+index 2ccfd9b..3583257 100644
+--- a/general_motion_retargeting/params.py
++++ b/general_motion_retargeting/params.py
+@@ -55,6 +55,15 @@ IK_CONFIG_DICT = {
+         "engineai_pm01": IK_CONFIG_ROOT / "bvh_lafan1_to_pm01.json",
+         "pal_talos": IK_CONFIG_ROOT / "bvh_to_talos.json",
+     },
++    "humanml":{
++        "unitree_g1": IK_CONFIG_ROOT / "humanml_to_g1.json",
++        "unitree_g1_with_hands": IK_CONFIG_ROOT / "humanml_to_g1.json",
++        "booster_t1_29dof": IK_CONFIG_ROOT / "bvh_lafan1_to_t1_29dof.json",
++        "fourier_n1": IK_CONFIG_ROOT / "bvh_lafan1_to_n1.json",
++        "stanford_toddy": IK_CONFIG_ROOT / "bvh_lafan1_to_toddy.json",
++        "engineai_pm01": IK_CONFIG_ROOT / "bvh_lafan1_to_pm01.json",
++        "pal_talos": IK_CONFIG_ROOT / "bvh_to_talos.json",
++    },
+     "bvh_nokov":{
+         "unitree_g1": IK_CONFIG_ROOT / "bvh_nokov_to_g1.json",
+     },
+@@ -119,4 +128,4 @@ VIEWER_CAM_DISTANCE_DICT = {
+     "tienkung": 3.0,
+     "pal_talos": 3.0,
+     "fourier_gr3": 2.0,
+-}
+\ No newline at end of file
++}
+diff --git a/general_motion_retargeting/robot_motion_viewer.py b/general_motion_retargeting/robot_motion_viewer.py
+index 8589d82..2fd8955 100644
+--- a/general_motion_retargeting/robot_motion_viewer.py
++++ b/general_motion_retargeting/robot_motion_viewer.py
+@@ -53,6 +53,8 @@ class RobotMotionViewer:
+                 video_path=None,
+                 video_width=640,
+                 video_height=480,
++                screenshot_width=1280,
++                screenshot_height=960,
+                 keyboard_callback=None,
+                 ):
+         
+@@ -68,6 +70,9 @@ class RobotMotionViewer:
+         self.rate_limiter = RateLimiter(frequency=self.motion_fps, warn=False)
+         self.camera_follow = camera_follow
+         self.record_video = record_video
++        self.screenshot_width = screenshot_width
++        self.screenshot_height = screenshot_height
++        self.renderer = None
+ 
+ 
+         self.viewer = mjv.launch_passive(
+@@ -89,9 +94,34 @@ class RobotMotionViewer:
+                 os.makedirs(video_dir)
+             self.mp4_writer = imageio.get_writer(self.video_path, fps=self.motion_fps)
+             print(f"Recording video to {self.video_path}")
+-            
+-            # Initialize renderer for video recording
+-            self.renderer = mj.Renderer(self.model, height=video_height, width=video_width)
++            self._ensure_renderer(width=video_width, height=video_height)
++
++    def _ensure_renderer(self, width=None, height=None):
++        if self.renderer is not None:
++            return
++        render_width = width if width is not None else self.screenshot_width
++        render_height = height if height is not None else self.screenshot_height
++        self.renderer = mj.Renderer(self.model, height=render_height, width=render_width)
++
++    def configure_camera(self, lookat=None, distance=None, elevation=None, azimuth=None):
++        if lookat is not None:
++            self.viewer.cam.lookat[:] = np.asarray(lookat, dtype=np.float64)
++        if distance is not None:
++            self.viewer.cam.distance = float(distance)
++        if elevation is not None:
++            self.viewer.cam.elevation = float(elevation)
++        if azimuth is not None:
++            self.viewer.cam.azimuth = float(azimuth)
++
++    def save_screenshot(self, image_path):
++        self._ensure_renderer()
++        image_dir = os.path.dirname(image_path)
++        if image_dir and not os.path.exists(image_dir):
++            os.makedirs(image_dir)
++        self.renderer.update_scene(self.data, camera=self.viewer.cam)
++        image = self.renderer.render()
++        imageio.imwrite(image_path, image)
++        print(f"Saved screenshot to {image_path}")
+         
+     def step(self, 
+             # robot data
+diff --git a/scripts/vis_robot_motion.py b/scripts/vis_robot_motion.py
+index 28747e7..ca7461b 100644
+--- a/scripts/vis_robot_motion.py
++++ b/scripts/vis_robot_motion.py
+@@ -1,7 +1,6 @@
+ from general_motion_retargeting import RobotMotionViewer, load_robot_motion
+ import argparse
+ import os
+-from tqdm import tqdm
+ 
+ if __name__ == "__main__":
+     parser = argparse.ArgumentParser()
+@@ -12,6 +11,16 @@ if __name__ == "__main__":
+     parser.add_argument("--record_video", action="store_true")
+     parser.add_argument("--video_path", type=str, 
+                         default="videos/example.mp4")
++    parser.add_argument("--screenshot_dir", type=str, default=None)
++    parser.add_argument("--frames", type=int, nargs="*", default=None, help="Frame indices to render once and save as images.")
++    parser.add_argument("--camera_distance", type=float, default=None)
++    parser.add_argument("--camera_elevation", type=float, default=None)
++    parser.add_argument("--camera_azimuth", type=float, default=None)
++    parser.add_argument("--camera_lookat_x", type=float, default=None)
++    parser.add_argument("--camera_lookat_y", type=float, default=None)
++    parser.add_argument("--camera_lookat_z", type=float, default=None)
++    parser.add_argument("--screenshot_width", type=int, default=1280)
++    parser.add_argument("--screenshot_height", type=int, default=960)
+                         
+     args = parser.parse_args()
+     
+@@ -26,7 +35,41 @@ if __name__ == "__main__":
+     env = RobotMotionViewer(robot_type=robot_type,
+                             motion_fps=motion_fps,
+                             camera_follow=False,
+-                            record_video=args.record_video, video_path=args.video_path)
++                            record_video=args.record_video,
++                            video_path=args.video_path,
++                            screenshot_width=args.screenshot_width,
++                            screenshot_height=args.screenshot_height)
++
++    camera_lookat = None
++    if any(value is not None for value in [args.camera_lookat_x, args.camera_lookat_y, args.camera_lookat_z]):
++        if not all(value is not None for value in [args.camera_lookat_x, args.camera_lookat_y, args.camera_lookat_z]):
++            raise ValueError("camera_lookat_x/y/z must be specified together")
++        camera_lookat = [args.camera_lookat_x, args.camera_lookat_y, args.camera_lookat_z]
++
++    if any(value is not None for value in [args.camera_distance, args.camera_elevation, args.camera_azimuth]) or camera_lookat is not None:
++        env.configure_camera(
++            lookat=camera_lookat,
++            distance=args.camera_distance,
++            elevation=args.camera_elevation,
++            azimuth=args.camera_azimuth,
++        )
++
++    if args.screenshot_dir is not None:
++        os.makedirs(args.screenshot_dir, exist_ok=True)
++        frame_indices = args.frames if args.frames else [0]
++        for frame_idx in frame_indices:
++            wrapped_idx = frame_idx % len(motion_root_pos)
++            env.step(
++                motion_root_pos[wrapped_idx],
++                motion_root_rot[wrapped_idx],
++                motion_dof_pos[wrapped_idx],
++                rate_limit=False,
++                follow_camera=False,
++            )
++            image_path = os.path.join(args.screenshot_dir, f"frame_{wrapped_idx:04d}.png")
++            env.save_screenshot(image_path)
++        env.close()
++        raise SystemExit(0)
+     
+     frame_idx = 0
+     while True:
+@@ -37,4 +80,4 @@ if __name__ == "__main__":
+         frame_idx += 1
+         if frame_idx >= len(motion_root_pos):
+             frame_idx = 0
+-    env.close()
+\ No newline at end of file
++    env.close()

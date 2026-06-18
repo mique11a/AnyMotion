@@ -1,0 +1,413 @@
+diff --git a/scripts/csv_to_npz.py b/scripts/csv_to_npz.py
+index 7c6b938..0a0390f 100644
+--- a/scripts/csv_to_npz.py
++++ b/scripts/csv_to_npz.py
+@@ -10,6 +10,9 @@
+ """Launch Isaac Sim Simulator first."""
+ 
+ import argparse
++import os
++from pathlib import Path
++
+ import numpy as np
+ 
+ from isaaclab.app import AppLauncher
+@@ -28,14 +31,42 @@ parser.add_argument(
+         " loaded."
+     ),
+ )
+-parser.add_argument("--output_name", type=str, required=True, help="The name of the motion npz file.")
++parser.add_argument("--output_name", type=str, default=None, help="The name used when uploading the motion to WandB.")
+ parser.add_argument("--output_fps", type=int, default=50, help="The fps of the output motion.")
++parser.add_argument("--output_file", type=str, default=None, help="Optional local output path for the generated npz.")
++parser.add_argument("--no_wandb", action="store_true", default=False, help="Skip WandB upload and save locally only.")
+ 
+ # append AppLauncher cli args
+ AppLauncher.add_app_launcher_args(parser)
+ # parse the arguments
+ args_cli = parser.parse_args()
+ 
++
++def _configure_single_gpu_kit_args() -> None:
++    """Prefer a single render GPU to avoid Vulkan/RTX init failures on busy multi-GPU hosts."""
++    if args_cli.device == "cpu":
++        return
++
++    if args_cli.device.startswith("cuda:"):
++        gpu_id = args_cli.device.split(":", 1)[1]
++    else:
++        gpu_id = "0"
++
++    kit_args = args_cli.kit_args or ""
++    if "--/renderer/multiGpu" in kit_args:
++        return
++
++    extra_args = [
++        "--/renderer/multiGpu/enabled=false",
++        "--/renderer/multiGpu/autoEnable=false",
++        "--/renderer/multiGpu/maxGpuCount=1",
++        f"--/renderer/activeGpu={gpu_id}",
++    ]
++    args_cli.kit_args = " ".join([kit_args, *extra_args]).strip()
++
++
++_configure_single_gpu_kit_args()
++
+ # launch omniverse app
+ app_launcher = AppLauncher(args_cli)
+ simulation_app = app_launcher.app
+@@ -58,6 +89,22 @@ from isaaclab.utils.math import axis_angle_from_quat, quat_conjugate, quat_mul,
+ from whole_body_tracking.robots.g1 import G1_CYLINDER_CFG
+ 
+ 
++def resolve_output_paths() -> tuple[str, str]:
++    if args_cli.output_name is not None:
++        motion_name = args_cli.output_name
++    elif args_cli.output_file is not None:
++        motion_name = Path(args_cli.output_file).stem
++    else:
++        motion_name = Path(args_cli.input_file).stem
++
++    if args_cli.output_file is not None:
++        output_file = os.path.abspath(os.path.expanduser(args_cli.output_file))
++    else:
++        output_file = f"/tmp/{motion_name}.npz"
++
++    return motion_name, output_file
++
++
+ @configclass
+ class ReplayMotionsSceneCfg(InteractiveSceneCfg):
+     """Configuration for a replay motions scene."""
+@@ -217,6 +264,7 @@ class MotionLoader:
+ 
+ def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene, joint_names: list[str]):
+     """Runs the simulation loop."""
++    motion_name, output_file = resolve_output_paths()
+     # Load motion
+     motion = MotionLoader(
+         motion_file=args_cli.input_file,
+@@ -298,17 +346,19 @@ def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene, joi
+             ):
+                 log[k] = np.stack(log[k], axis=0)
+ 
+-            np.savez("/tmp/motion.npz", **log)
++            os.makedirs(os.path.dirname(output_file), exist_ok=True)
++            np.savez(output_file, **log)
++            print(f"[INFO]: Motion saved locally to {output_file}")
+ 
+-            import wandb
++            if not args_cli.no_wandb:
++                import wandb
+ 
+-            COLLECTION = args_cli.output_name
+-            run = wandb.init(project="csv_to_npz", name=COLLECTION)
+-            print(f"[INFO]: Logging motion to wandb: {COLLECTION}")
+-            REGISTRY = "motions"
+-            logged_artifact = run.log_artifact(artifact_or_path="/tmp/motion.npz", name=COLLECTION, type=REGISTRY)
+-            run.link_artifact(artifact=logged_artifact, target_path=f"wandb-registry-{REGISTRY}/{COLLECTION}")
+-            print(f"[INFO]: Motion saved to wandb registry: {REGISTRY}/{COLLECTION}")
++                run = wandb.init(project="csv_to_npz", name=motion_name)
++                print(f"[INFO]: Logging motion to wandb: {motion_name}")
++                registry = "motions"
++                logged_artifact = run.log_artifact(artifact_or_path=output_file, name=motion_name, type=registry)
++                run.link_artifact(artifact=logged_artifact, target_path=f"wandb-registry-{registry}/{motion_name}")
++                print(f"[INFO]: Motion saved to wandb registry: {registry}/{motion_name}")
+ 
+ 
+ def main():
+diff --git a/scripts/replay_npz.py b/scripts/replay_npz.py
+index f926c8e..d901aa4 100644
+--- a/scripts/replay_npz.py
++++ b/scripts/replay_npz.py
+@@ -9,6 +9,8 @@
+ """Launch Isaac Sim Simulator first."""
+ 
+ import argparse
++import os
++
+ import numpy as np
+ import torch
+ 
+@@ -16,12 +18,41 @@ from isaaclab.app import AppLauncher
+ 
+ # add argparse arguments
+ parser = argparse.ArgumentParser(description="Replay converted motions.")
+-parser.add_argument("--registry_name", type=str, required=True, help="The name of the wand registry.")
++parser.add_argument("--registry_name", type=str, default=None, help="The name of the WandB registry artifact.")
++parser.add_argument("--motion_file", type=str, default=None, help="Local path to a preprocessed motion .npz file.")
+ 
+ # append AppLauncher cli args
+ AppLauncher.add_app_launcher_args(parser)
+ # parse the arguments
+ args_cli = parser.parse_args()
++if args_cli.registry_name is None and args_cli.motion_file is None:
++    parser.error("one of --registry_name or --motion_file is required")
++
++
++def _configure_single_gpu_kit_args() -> None:
++    """Prefer a single render GPU to avoid Vulkan/RTX init failures on busy multi-GPU hosts."""
++    if args_cli.device == "cpu":
++        return
++
++    if args_cli.device.startswith("cuda:"):
++        gpu_id = args_cli.device.split(":", 1)[1]
++    else:
++        gpu_id = "0"
++
++    kit_args = args_cli.kit_args or ""
++    if "--/renderer/multiGpu" in kit_args:
++        return
++
++    extra_args = [
++        "--/renderer/multiGpu/enabled=false",
++        "--/renderer/multiGpu/autoEnable=false",
++        "--/renderer/multiGpu/maxGpuCount=1",
++        f"--/renderer/activeGpu={gpu_id}",
++    ]
++    args_cli.kit_args = " ".join([kit_args, *extra_args]).strip()
++
++
++_configure_single_gpu_kit_args()
+ 
+ # launch omniverse app
+ app_launcher = AppLauncher(args_cli)
+@@ -67,16 +98,19 @@ def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene):
+     # Define simulation stepping
+     sim_dt = sim.get_physics_dt()
+ 
+-    registry_name = args_cli.registry_name
+-    if ":" not in registry_name:  # Check if the registry name includes alias, if not, append ":latest"
+-        registry_name += ":latest"
+-    import pathlib
++    if args_cli.motion_file is not None:
++        motion_file = os.path.abspath(os.path.expanduser(args_cli.motion_file))
++    else:
++        registry_name = args_cli.registry_name
++        if ":" not in registry_name:  # Check if the registry name includes alias, if not, append ":latest"
++            registry_name += ":latest"
++        import pathlib
+ 
+-    import wandb
++        import wandb
+ 
+-    api = wandb.Api()
+-    artifact = api.artifact(registry_name)
+-    motion_file = str(pathlib.Path(artifact.download()) / "motion.npz")
++        api = wandb.Api()
++        artifact = api.artifact(registry_name)
++        motion_file = str(pathlib.Path(artifact.download()) / "motion.npz")
+ 
+     motion = MotionLoader(
+         motion_file,
+diff --git a/scripts/rsl_rl/play.py b/scripts/rsl_rl/play.py
+index 6d35bfd..aed5e22 100644
+--- a/scripts/rsl_rl/play.py
++++ b/scripts/rsl_rl/play.py
+@@ -29,9 +29,34 @@ args_cli, hydra_args = parser.parse_known_args()
+ if args_cli.video:
+     args_cli.enable_cameras = True
+ 
++
++def _configure_single_gpu_kit_args() -> None:
++    """Prefer a single render GPU to avoid Vulkan/RTX init failures on busy multi-GPU hosts."""
++    if args_cli.device == "cpu":
++        return
++
++    if args_cli.device.startswith("cuda:"):
++        gpu_id = args_cli.device.split(":", 1)[1]
++    else:
++        gpu_id = "0"
++
++    kit_args = args_cli.kit_args or ""
++    if "--/renderer/multiGpu" in kit_args:
++        return
++
++    extra_args = [
++        "--/renderer/multiGpu/enabled=false",
++        "--/renderer/multiGpu/autoEnable=false",
++        "--/renderer/multiGpu/maxGpuCount=1",
++        f"--/renderer/activeGpu={gpu_id}",
++    ]
++    args_cli.kit_args = " ".join([kit_args, *extra_args]).strip()
++
+ # clear out sys.argv for Hydra
+ sys.argv = [sys.argv[0]] + hydra_args
+ 
++_configure_single_gpu_kit_args()
++
+ # launch omniverse app
+ app_launcher = AppLauncher(args_cli)
+ simulation_app = app_launcher.app
+@@ -109,6 +134,9 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
+         print(f"[INFO] Loading experiment from directory: {log_root_path}")
+         resume_path = get_checkpoint_path(log_root_path, agent_cfg.load_run, agent_cfg.load_checkpoint)
+         print(f"[INFO]: Loading model checkpoint from: {resume_path}")
++        if args_cli.motion_file is not None:
++            print(f"[INFO]: Using motion file from CLI: {args_cli.motion_file}")
++            env_cfg.commands.motion.motion_file = os.path.abspath(os.path.expanduser(args_cli.motion_file))
+ 
+     # create isaac environment
+     env = gym.make(args_cli.task, cfg=env_cfg, render_mode="rgb_array" if args_cli.video else None)
+diff --git a/scripts/rsl_rl/train.py b/scripts/rsl_rl/train.py
+index c9fd5f8..c565df7 100644
+--- a/scripts/rsl_rl/train.py
++++ b/scripts/rsl_rl/train.py
+@@ -8,6 +8,7 @@
+ """Launch Isaac Sim Simulator first."""
+ 
+ import argparse
++import pickle
+ import sys
+ 
+ from isaaclab.app import AppLauncher
+@@ -24,18 +25,55 @@ parser.add_argument("--num_envs", type=int, default=None, help="Number of enviro
+ parser.add_argument("--task", type=str, default=None, help="Name of the task.")
+ parser.add_argument("--seed", type=int, default=None, help="Seed used for the environment")
+ parser.add_argument("--max_iterations", type=int, default=None, help="RL Policy training iterations.")
+-parser.add_argument("--registry_name", type=str, required=True, help="The name of the wand registry.")
++parser.add_argument("--registry_name", type=str, default=None, help="The name of the WandB registry artifact.")
++parser.add_argument("--motion_file", type=str, default=None, help="Local path to a preprocessed motion .npz file.")
+ 
+ # append RSL-RL cli arguments
+ cli_args.add_rsl_rl_args(parser)
+ # append AppLauncher cli args
+ AppLauncher.add_app_launcher_args(parser)
+ args_cli, hydra_args = parser.parse_known_args()
++if args_cli.registry_name is None and args_cli.motion_file is None:
++    parser.error("one of --registry_name or --motion_file is required")
++
++
++def _configure_single_gpu_kit_args() -> None:
++    """Prefer a single render GPU to avoid Vulkan/RTX init failures on busy multi-GPU hosts."""
++    if args_cli.device == "cpu":
++        return
++
++    if args_cli.device.startswith("cuda:"):
++        gpu_id = args_cli.device.split(":", 1)[1]
++    else:
++        gpu_id = "0"
++
++    kit_args = args_cli.kit_args or ""
++    if "--/renderer/multiGpu" in kit_args:
++        return
++
++    extra_args = [
++        "--/renderer/multiGpu/enabled=false",
++        "--/renderer/multiGpu/autoEnable=false",
++        "--/renderer/multiGpu/maxGpuCount=1",
++        f"--/renderer/activeGpu={gpu_id}",
++    ]
++    args_cli.kit_args = " ".join([kit_args, *extra_args]).strip()
++
++
++def dump_pickle(filename: str, data: object) -> None:
++    """Compatibility helper for Isaac Lab versions that no longer export dump_pickle."""
++    if not filename.endswith(".pkl"):
++        filename += ".pkl"
++    os.makedirs(os.path.dirname(filename), exist_ok=True)
++    with open(filename, "wb") as file_obj:
++        pickle.dump(data, file_obj)
+ 
+ # always enable cameras to record video
+ if args_cli.video:
+     args_cli.enable_cameras = True
+ 
++_configure_single_gpu_kit_args()
++
+ # clear out sys.argv for Hydra
+ sys.argv = [sys.argv[0]] + hydra_args
+ 
+@@ -58,7 +96,7 @@ from isaaclab.envs import (
+     multi_agent_to_single_agent,
+ )
+ from isaaclab.utils.dict import print_dict
+-from isaaclab.utils.io import dump_pickle, dump_yaml
++from isaaclab.utils.io import dump_yaml
+ from isaaclab_rl.rsl_rl import RslRlOnPolicyRunnerCfg, RslRlVecEnvWrapper
+ from isaaclab_tasks.utils import get_checkpoint_path
+ from isaaclab_tasks.utils.hydra import hydra_task_config
+@@ -88,17 +126,20 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
+     env_cfg.seed = agent_cfg.seed
+     env_cfg.sim.device = args_cli.device if args_cli.device is not None else env_cfg.sim.device
+ 
+-    # load the motion file from the wandb registry
+-    registry_name = args_cli.registry_name
+-    if ":" not in registry_name:  # Check if the registry name includes alias, if not, append ":latest"
+-        registry_name += ":latest"
+-    import pathlib
++    registry_name = None
++    if args_cli.motion_file is not None:
++        env_cfg.commands.motion.motion_file = os.path.abspath(os.path.expanduser(args_cli.motion_file))
++    else:
++        registry_name = args_cli.registry_name
++        if ":" not in registry_name:  # Check if the registry name includes alias, if not, append ":latest"
++            registry_name += ":latest"
++        import pathlib
+ 
+-    import wandb
++        import wandb
+ 
+-    api = wandb.Api()
+-    artifact = api.artifact(registry_name)
+-    env_cfg.commands.motion.motion_file = str(pathlib.Path(artifact.download()) / "motion.npz")
++        api = wandb.Api()
++        artifact = api.artifact(registry_name)
++        env_cfg.commands.motion.motion_file = str(pathlib.Path(artifact.download()) / "motion.npz")
+ 
+     # specify directory for logging experiments
+     log_root_path = os.path.join("logs", "rsl_rl", agent_cfg.experiment_name)
+diff --git a/source/whole_body_tracking/whole_body_tracking/tasks/tracking/tracking_env_cfg.py b/source/whole_body_tracking/whole_body_tracking/tasks/tracking/tracking_env_cfg.py
+index b050402..b8c4c2a 100644
+--- a/source/whole_body_tracking/whole_body_tracking/tasks/tracking/tracking_env_cfg.py
++++ b/source/whole_body_tracking/whole_body_tracking/tasks/tracking/tracking_env_cfg.py
+@@ -13,7 +13,7 @@ from isaaclab.managers import SceneEntityCfg
+ from isaaclab.managers import TerminationTermCfg as DoneTerm
+ from isaaclab.scene import InteractiveSceneCfg
+ from isaaclab.sensors import ContactSensorCfg
+-from isaaclab.terrains import TerrainImporterCfg
++from isaaclab.terrains import MeshPlaneTerrainCfg, TerrainGeneratorCfg, TerrainImporterCfg
+ 
+ ##
+ # Pre-defined configs
+@@ -44,7 +44,25 @@ class MySceneCfg(InteractiveSceneCfg):
+     # ground terrain
+     terrain = TerrainImporterCfg(
+         prim_path="/World/ground",
+-        terrain_type="plane",
++        terrain_type="generator",
++        terrain_generator=TerrainGeneratorCfg(
++            curriculum=False,
++            size=(8.0, 8.0),
++            border_width=0.0,
++            num_rows=64,
++            num_cols=64,
++            color_scheme="none",
++            horizontal_scale=0.1,
++            vertical_scale=0.005,
++            slope_threshold=None,
++            use_cache=False,
++            sub_terrains={
++                "flat": MeshPlaneTerrainCfg(
++                    proportion=1.0,
++                    size=(8.0, 8.0),
++                ),
++            },
++        ),
+         collision_group=-1,
+         physics_material=sim_utils.RigidBodyMaterialCfg(
+             friction_combine_mode="multiply",
+@@ -52,10 +70,10 @@ class MySceneCfg(InteractiveSceneCfg):
+             static_friction=1.0,
+             dynamic_friction=1.0,
+         ),
+-        visual_material=sim_utils.MdlFileCfg(
+-            mdl_path="{NVIDIA_NUCLEUS_DIR}/Materials/Base/Architecture/Shingles_01.mdl",
+-            project_uvw=True,
++        visual_material=sim_utils.PreviewSurfaceCfg(
++            diffuse_color=(0.08, 0.08, 0.08),
+         ),
++        max_init_terrain_level=0,
+     )
+     # robots
+     robot: ArticulationCfg = MISSING

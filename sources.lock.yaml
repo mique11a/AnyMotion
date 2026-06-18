@@ -1,0 +1,35 @@
+workspace_root: src
+
+repositories:
+  GMR:
+    url: https://github.com/YanjieZe/GMR.git
+    commit: bb1bbe40774794fceb2a7c579a3464a28e68c844
+    path: src/GMR
+    patch: patches/gmr.patch
+  whole_body_tracking:
+    url: https://github.com/HybridRobotics/whole_body_tracking.git
+    commit: cd65172032893724b445448818c34165846d847d
+    path: src/whole_body_tracking
+    patch: patches/whole_body_tracking.patch
+  motion_tracking_controller:
+    url: https://github.com/HybridRobotics/motion_tracking_controller.git
+    commit: cbdb4a80d5ea506b2045bdd39cdfb4058084aeb4
+    path: src/colcon_ws/src/motion_tracking_controller
+    patch: patches/motion_tracking_controller.patch
+  unitree_bringup:
+    url: https://github.com/qiayuanl/unitree_bringup.git
+    commit: 1b2c83dd846e92eee5b070e9551b6845257b0785
+    path: src/colcon_ws/src/unitree_bringup
+  motion-diffusion-model:
+    url: https://github.com/guytevet/motion-diffusion-model.git
+    commit: ef8edce6a53c6ab19e53b4d4dcf15bc0bc60a778
+    path: src/motion-diffusion-model
+  HumanML3D:
+    url: https://github.com/EricGuo5513/HumanML3D.git
+    commit: 9176e8fb446b71c7d2a725eb5cf6fec1ae3b3c23
+    path: src/HumanML3D
+
+runtime:
+  python: "3.10"
+  isaac_sim: "4.5.0.0"
+  isaac_lab: "v2.1.0"

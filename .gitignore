@@ -1,0 +1,41 @@
+# Root build artifacts
+/build/
+/install/
+/log/
+
+# Workspace sources are reconstructed from upstream repos + patches
+/src/
+
+# Python cache
+__pycache__/
+*.py[cod]
+
+# Local notes and editor files
+/指令.md
+.DS_Store
+.idea/
+.vscode/
+
+# Large generated artifacts / model weights
+*.pt
+*.pth
+*.ckpt
+*.onnx
+*.engine
+*.npz
+*.npy
+*.pkl
+*.tar
+*.tar.gz
+*.wandb
+events.out.tfevents.*
+
+# Experiment outputs
+wandb/
+logs/
+outputs/
+videos/
+retargeting_data/
+
+# Docs: keep markdown, ignore bundled PDFs
+/docs/*.pdf

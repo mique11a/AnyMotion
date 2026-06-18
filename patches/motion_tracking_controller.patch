@@ -1,0 +1,115 @@
+diff --git a/config/g1/controllers.yaml b/config/g1/controllers.yaml
+index 926ffc4..c23e236 100644
+--- a/config/g1/controllers.yaml
++++ b/config/g1/controllers.yaml
+@@ -48,5 +48,4 @@ standby_controller:
+           3.0, 3.0, 3.0, 3.0, 3.0, 3.0, 3.0 ]
+ 
+ walking_controller:
+-  ros__parameters:
+-    update_rate: 50 # Remove this line if using Humble!!!
++  ros__parameters: {}
+diff --git a/launch/mujoco.launch.py b/launch/mujoco.launch.py
+index 764f189..e9fac9e 100644
+--- a/launch/mujoco.launch.py
++++ b/launch/mujoco.launch.py
+@@ -1,4 +1,5 @@
+ import os
++import sys
+ 
+ from launch import LaunchDescription
+ from launch.actions import (
+@@ -11,7 +12,9 @@ from launch.launch_description_sources import PythonLaunchDescriptionSource
+ from launch.substitutions import Command, FindExecutable, PathJoinSubstitution, LaunchConfiguration, PythonExpression
+ from launch_ros.actions import Node
+ from launch_ros.substitutions import FindPackageShare
+-from legged_bringup.launch_utils import (
++
++sys.path.insert(0, os.path.dirname(__file__))
++from launch_utils import (
+     get_controller_names, generate_temp_config, resolve_policy_paths, download_wandb_onnx, control_spawner
+ )
+ 
+diff --git a/launch/real.launch.py b/launch/real.launch.py
+index a96c5b0..d785e46 100644
+--- a/launch/real.launch.py
++++ b/launch/real.launch.py
+@@ -1,4 +1,5 @@
+ import os
++import sys
+ 
+ from launch import LaunchDescription
+ from launch.actions import (
+@@ -12,11 +13,27 @@ from launch.launch_description_sources import PythonLaunchDescriptionSource
+ from launch.substitutions import Command, FindExecutable, PathJoinSubstitution, LaunchConfiguration, PythonExpression
+ from launch_ros.actions import Node
+ from launch_ros.substitutions import FindPackageShare
+-from legged_bringup.launch_utils import (
++
++sys.path.insert(0, os.path.dirname(__file__))
++from launch_utils import (
+     get_controller_names, generate_temp_config, resolve_policy_paths, download_wandb_onnx, control_spawner
+ )
+ 
+ 
++def _build_runtime_library_path(extra_entries):
++    entries = []
++    for path in extra_entries:
++        expanded = os.path.abspath(os.path.expanduser(os.path.expandvars(path)))
++        if os.path.isdir(expanded) and expanded not in entries:
++            entries.append(expanded)
++
++    current_ld = os.environ.get("LD_LIBRARY_PATH", "")
++    for path in current_ld.split(os.pathsep):
++        if path and path not in entries:
++            entries.append(path)
++    return os.pathsep.join(entries)
++
++
+ def setup_controllers(context):
+     robot_type_value = LaunchConfiguration('robot_type').perform(context)
+     policy_path_value = LaunchConfiguration('policy_path').perform(context)
+@@ -66,6 +83,12 @@ def generate_launch_description():
+     network_interface = LaunchConfiguration('network_interface')
+     urdf_name = PythonExpression(["'g1' if '", robot_type, "' == 'g1' else 'sdk1'"])
+ 
++    control_node_ld_library_path = _build_runtime_library_path([
++        "/opt/unitree_robotics/lib",
++        "/opt/ros/humble/lib/x86_64-linux-gnu",
++        "/opt/ros/humble/lib",
++    ])
++
+     robot_description_command = Command([
+         PathJoinSubstitution([FindExecutable(name='xacro')]),
+         " ",
+@@ -97,6 +120,9 @@ def generate_launch_description():
+         parameters=[robot_description, LaunchConfiguration('controllers_yaml')],
+         output="both",
+         respawn=True,
++        additional_env={
++            "LD_LIBRARY_PATH": control_node_ld_library_path,
++        },
+     )
+ 
+     controllers_opaque_func = OpaqueFunction(function=setup_controllers)
+@@ -123,7 +149,7 @@ def generate_launch_description():
+ 
+     rosbag2 = ExecuteProcess(
+         cmd=[
+-            'ros2', 'bag', 'record', '-s', 'mcap', '-a',  # record all topics
++            'ros2', 'bag', 'record', '-s', LaunchConfiguration('rosbag_storage_id'), '-a',  # record all topics
+             '--exclude-regex', exclude_regex,  # skip those that match the regex
+         ],
+         output='screen',
+@@ -158,6 +184,11 @@ def generate_launch_description():
+             default_value='',
+             description='W&B run path to download ONNX from (used when policy_path is empty)'
+         ),
++        DeclareLaunchArgument(
++            'rosbag_storage_id',
++            default_value='sqlite3',
++            description='rosbag2 storage backend. Use mcap only if the plugin is installed.'
++        ),
+         controllers_opaque_func,
+         control_node,
+         node_robot_state_publisher,
